@@ -1,12 +1,12 @@
 use super::store::Resolve;
 use super::*;
 
-use crate::frame::{Reason, StreamId};
+use crate::frame::Reason;
 
 use crate::codec::UserError;
 use crate::codec::UserError::*;
 
-use bytes::buf::{Buf, Take};
+use bytes::buf::Take;
 use std::{
     cmp::{self, Ordering},
     fmt, io, mem,
@@ -184,6 +184,8 @@ impl Prioritize {
             stream.requested_send_capacity =
                 cmp::min(stream.buffered_send_data, WindowSize::MAX as usize) as WindowSize;
 
+            // `try_assign_capacity` will queue the stream to `pending_capacity` if the capcaity
+            // cannot be assigned at the time it is called.
             self.try_assign_capacity(stream);
         }
 
@@ -339,13 +341,18 @@ impl Prioritize {
     /// Reclaim just reserved capacity, not buffered capacity, and re-assign
     /// it to the connection
     pub fn reclaim_reserved_capacity(&mut self, stream: &mut store::Ptr, counts: &mut Counts) {
-        // only reclaim requested capacity that isn't already buffered
-        if stream.requested_send_capacity as usize > stream.buffered_send_data {
-            let reserved = stream.requested_send_capacity - stream.buffered_send_data as WindowSize;
+        // only reclaim reserved capacity that isn't already buffered
+        if stream.send_flow.available().as_size() as usize > stream.buffered_send_data {
+            let reserved =
+                stream.send_flow.available().as_size() - stream.buffered_send_data as WindowSize;
 
-            // TODO: proper error handling
-            let _res = stream.send_flow.claim_capacity(reserved);
-            debug_assert!(_res.is_ok());
+            // Panic safety: due to how `reserved` is computed it can't be greater
+            // than what's available.
+            stream
+                .send_flow
+                .claim_capacity(reserved)
+                .expect("window size should be greater than reserved");
+
             self.assign_connection_capacity(reserved, stream, counts);
         }
     }
@@ -401,6 +408,12 @@ impl Prioritize {
 
     /// Request capacity to send data
     fn try_assign_capacity(&mut self, stream: &mut store::Ptr) {
+        // Streams over the max concurrent count should not have capacity assign to avoid starving the connection
+        // capacity for open streams
+        if stream.is_pending_open {
+            return;
+        }
+
         let total_requested = stream.requested_send_capacity;
 
         // Total requested should never go below actual assigned
@@ -429,14 +442,10 @@ impl Prioritize {
             return;
         }
 
-        // If the stream has requested capacity, then it must be in the
-        // streaming state (more data could be sent) or there is buffered data
-        // waiting to be sent.
-        debug_assert!(
-            stream.state.is_send_streaming() || stream.buffered_send_data > 0,
-            "state={:?}",
-            stream.state
-        );
+        // The stream may have been reset or closed since capacity was requested.
+        if !stream.state.is_send_streaming() && stream.buffered_send_data == 0 {
+            return;
+        }
 
         // The amount of currently available capacity on the connection
         let conn_available = self.flow.available().as_size();
@@ -522,6 +531,7 @@ impl Prioritize {
         loop {
             if let Some(mut stream) = self.pop_pending_open(store, counts) {
                 self.pending_send.push_front(&mut stream);
+                self.try_assign_capacity(&mut stream);
             }
 
             match self.pop_frame(buffer, store, max_frame_len, counts) {
@@ -671,8 +681,11 @@ impl Prioritize {
     }
 
     pub fn clear_pending_send(&mut self, store: &mut Store, counts: &mut Counts) {
-        while let Some(stream) = self.pending_send.pop(store) {
+        while let Some(mut stream) = self.pending_send.pop(store) {
             let is_pending_reset = stream.is_pending_reset_expiration();
+            if let Some(reason) = stream.state.get_scheduled_reset() {
+                stream.set_reset(reason, Initiator::Library);
+            }
             counts.transition_after(stream, is_pending_reset);
         }
     }
@@ -714,6 +727,23 @@ impl Prioritize {
 
                     let frame = match stream.pending_send.pop_front(buffer) {
                         Some(Frame::Data(mut frame)) => {
+                            if let Some(reason) = stream.state.get_scheduled_reset() {
+                                // If a reset is scheduled due to cancellation or
+                                // an error, discard buffered DATA and let the `None`
+                                // arm emit the RST_STREAM on the next iteration.
+                                //
+                                // NO_ERROR is excluded. Per RFC 9113 §8.1, a NO_ERROR
+                                // stream reset may only be sent after a complete
+                                // response, which requires sending all queued DATA.
+                                if reason != Reason::NO_ERROR {
+                                    stream.pending_send.push_front(buffer, frame.into());
+                                    self.clear_queue(buffer, &mut stream);
+                                    self.reclaim_all_capacity(&mut stream, counts);
+                                    self.pending_send.push(&mut stream);
+                                    continue;
+                                }
+                            }
+
                             // Get the amount of capacity remaining for stream's
                             // window.
                             let stream_capacity = stream.send_flow.available();
@@ -830,10 +860,7 @@ impl Prioritize {
                         }),
                         None => {
                             if let Some(reason) = stream.state.get_scheduled_reset() {
-                                let stream_id = stream.id;
-                                stream
-                                    .state
-                                    .set_reset(stream_id, reason, Initiator::Library);
+                                stream.set_reset(reason, Initiator::Library);
 
                                 let frame = frame::Reset::new(stream.id, reason);
                                 Frame::Reset(frame)

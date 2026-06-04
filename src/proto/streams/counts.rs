@@ -1,7 +1,5 @@
 use super::*;
 
-use std::usize;
-
 #[derive(Debug)]
 pub(super) struct Counts {
     /// Acting as a client or server. This allows us to track which values to
@@ -31,6 +29,16 @@ pub(super) struct Counts {
 
     /// Current number of "pending accept" streams that were remotely reset
     num_remote_reset_streams: usize,
+
+    /// Maximum number of locally reset streams due to protocol error across
+    /// the lifetime of the connection.
+    ///
+    /// When this gets exceeded, we issue GOAWAYs.
+    max_local_error_reset_streams: Option<usize>,
+
+    /// Total number of locally reset streams due to protocol error across the
+    /// lifetime of the connection.
+    num_local_error_reset_streams: usize,
 }
 
 impl Counts {
@@ -46,6 +54,8 @@ impl Counts {
             num_local_reset_streams: 0,
             max_remote_reset_streams: config.remote_reset_max,
             num_remote_reset_streams: 0,
+            max_local_error_reset_streams: config.local_max_error_reset_streams,
+            num_local_error_reset_streams: 0,
         }
     }
 
@@ -64,6 +74,26 @@ impl Counts {
 
     pub fn has_streams(&self) -> bool {
         self.num_send_streams != 0 || self.num_recv_streams != 0
+    }
+
+    /// Returns true if we can issue another local reset due to protocol error.
+    pub fn can_inc_num_local_error_resets(&self) -> bool {
+        if let Some(max) = self.max_local_error_reset_streams {
+            max > self.num_local_error_reset_streams
+        } else {
+            true
+        }
+    }
+
+    pub fn inc_num_local_error_resets(&mut self) {
+        assert!(self.can_inc_num_local_error_resets());
+
+        // Increment the number of remote initiated streams
+        self.num_local_error_reset_streams += 1;
+    }
+
+    pub(crate) fn max_local_error_resets(&self) -> Option<usize> {
+        self.max_local_error_reset_streams
     }
 
     /// Returns true if the receive stream concurrency can be incremented
@@ -147,9 +177,11 @@ impl Counts {
         self.num_remote_reset_streams -= 1;
     }
 
-    pub fn apply_remote_settings(&mut self, settings: &frame::Settings) {
-        if let Some(val) = settings.max_concurrent_streams() {
-            self.max_send_streams = val as usize;
+    pub fn apply_remote_settings(&mut self, settings: &frame::Settings, is_initial: bool) {
+        match settings.max_concurrent_streams() {
+            Some(val) => self.max_send_streams = val as usize,
+            None if is_initial => self.max_send_streams = usize::MAX,
+            None => {}
         }
     }
 
@@ -197,7 +229,7 @@ impl Counts {
                 }
             }
 
-            if stream.is_counted {
+            if !stream.state.is_scheduled_reset() && stream.is_counted {
                 tracing::trace!("dec_num_streams; stream={:?}", stream.id);
                 // Decrement the number of active streams.
                 self.dec_num_streams(&mut stream);
